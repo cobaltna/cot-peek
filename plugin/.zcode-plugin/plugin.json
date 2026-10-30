@@ -1,0 +1,11 @@
+{
+  "name": "cot-peek",
+  "version": "1.0.0",
+  "description": "思考小窗：悬浮球实时翻译 ZCode 思维链，半秒上屏，空闲零 CPU，附划词翻译。",
+  "author": {
+    "name": "cobaltna"
+  },
+  "license": "MIT",
+  "skills": "skills",
+  "commands": "commands"
+}

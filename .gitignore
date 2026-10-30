@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+cot_peek.log
+cot_peek.json
+cot_peek.lock
