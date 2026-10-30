@@ -12,16 +12,16 @@
     {
       "name": "cot-peek",
       "source": "./plugin",
-      "version": "1.0.1",
+      "version": "1.0.2",
       "displayName": "思考小窗",
       "displayName_i18n": {
         "en": "Cot Peek",
         "zh-CN": "思考小窗"
       },
-      "description": "A floating ball that translates ZCode reasoning traces into Chinese in real time, plus on-the-fly clipboard translation.",
+      "description": "A floating ball that translates English reasoning traces into Chinese in real time, plus on-the-fly clipboard translation.",
       "description_i18n": {
-        "en": "A floating ball that translates ZCode reasoning traces into Chinese in real time, plus on-the-fly clipboard translation.",
-        "zh-CN": "思考小窗：悬浮球实时把 ZCode 的英文思维链翻成中文，半秒上屏，空闲零 CPU。附划词翻译，复制英文即出中文。"
+        "en": "A floating ball that translates English reasoning traces into Chinese in real time, plus on-the-fly clipboard translation.",
+        "zh-CN": "思考小窗：悬浮球实时翻译英文思维链，半秒上屏，空闲零 CPU。附划词翻译，复制英文即出中文。"
       },
       "author": {
         "name": "cobaltna"
@@ -29,6 +29,7 @@
       "homepage": "https://github.com/cobaltna/cot-peek",
       "category": "productivity",
       "keywords": [
+        "zcode",
         "translation",
         "cot",
         "reasoning",
