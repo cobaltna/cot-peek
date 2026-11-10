@@ -29,6 +29,7 @@ import math
 import os
 import queue
 import re
+import sqlite3
 import struct
 import subprocess
 import threading
@@ -309,6 +310,50 @@ def write_lock(obj):
     except OSError:
         pass
 
+# ---------------------------------------------------------------- 会话信息（只读）
+# ZCode 把会话标题与人类输入记录在本地 sqlite。只读连接即可拿到
+# 「当前用户在哪个会话打字」：input_history 只记人类输入，后台会话不掺和。
+
+DB_PATH = os.path.expanduser("~/.zcode/cli/db/db.sqlite")
+
+
+def _zdb():
+    return sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=1.0)
+
+
+def latest_input_session():
+    """最近一次人类输入所在的会话 id；读不到返回 None。"""
+    try:
+        con = _zdb()
+        try:
+            row = con.execute(
+                "SELECT session_id FROM input_history "
+                "ORDER BY time_created DESC LIMIT 1").fetchone()
+            return row[0] if row else None
+        finally:
+            con.close()
+    except Exception:
+        return None
+
+
+def session_titles(ids):
+    """批量取会话标题；失败返回空字典。"""
+    ids = [i for i in ids if i]
+    if not ids:
+        return {}
+    try:
+        con = _zdb()
+        try:
+            marks = ",".join("?" * len(ids))
+            rows = con.execute(
+                f"SELECT id, title FROM session WHERE id IN ({marks})",
+                ids).fetchall()
+            return {r[0]: (r[1] or "") for r in rows}
+        finally:
+            con.close()
+    except Exception:
+        return {}
+
 # ---------------------------------------------------------------- 基础工具
 
 CJK_RE = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
@@ -582,19 +627,20 @@ def split_round(text, cap=1000):
 
 _ROUND_SEQ = itertools.count(1)
 
-def enqueue_cot(job_q, state, text, label):
+def enqueue_cot(job_q, state, text, label, sid=None):
     """把一轮思考分段入队；已有 pending/done 的段跳过。
-    返回 (新入队段数, 总段数)。"""
+    返回 (新入队段数, 总段数)。state 以 (sid, 段文本) 为键，会话之间互不干扰。"""
     segs = split_round(text)
     rid = next(_ROUND_SEQ)
-    skip = tuple(i for i, seg in enumerate(segs) if seg in state)
     n = 0
-    for i, seg in enumerate(segs):
-        if seg in state:
-            continue
-        state[seg] = "pending"
-        job_q.put(("cot", seg, (rid, label, i, len(segs), skip)))
-        n += 1
+    with STATE_LOCK:
+        skip = tuple(i for i, seg in enumerate(segs) if (sid, seg) in state)
+        for i, seg in enumerate(segs):
+            if (sid, seg) in state:
+                continue
+            state[(sid, seg)] = "pending"
+            job_q.put(("cot", seg, (rid, sid, label, i, len(segs), skip)))
+            n += 1
     log(f"轮次 {len(text)}字 → {len(segs)}段, 新入队 {n}")
     return n, len(segs)
 
@@ -636,19 +682,19 @@ def _dir_watch_thread(path, ev, stop):
             stop.wait(0.5)
 
 
-def watch_loop(rollout_dir, job_q, ui_q, pause, state, stop=None):
+def watch_loop(rollout_dir, job_q, ui_q, pause, state, focus_state, stop=None):
     """按文件独立跟踪各会话：启动时已有的文件跳过历史；启动后新出现的
     会话文件从头翻（≤2MB，整行可能已在轮询间隙写完；更大的续开旧会话
-    只回看最后 8000 字）。多会话同时活跃时各自翻译，轮次带会话短标记。
-    目录事件驱动（~0.15s 感知），5 秒兜底全扫防漏事件。"""
+    只回看最后 8000 字）。只翻窗口当前显示的会话，其余会话只推进偏移，
+    切换视图时由回溯补齐。目录事件驱动（~0.15s 感知），5 秒兜底全扫。"""
     stop = stop or threading.Event()
     ev = threading.Event()
     threading.Thread(target=_dir_watch_thread, args=(rollout_dir, ev, stop),
                      daemon=True).start()
     offsets = {}
     started = False
-    active = {}          # path -> 会话短标记（出过轮次的才算活跃）
-    last_newest = None
+    active = {}          # path -> (sid, 会话短标记)
+    seen_sids = set()
     while not stop.is_set():
         try:
             files = glob.glob(os.path.join(rollout_dir, "model-io-session_*.jsonl"))
@@ -657,6 +703,11 @@ def watch_loop(rollout_dir, job_q, ui_q, pause, state, stop=None):
                 for f in files:
                     offsets[f] = os.path.getsize(f)
             for f in files:
+                m = re.search(r"session_([0-9a-f]+)", f)
+                sid = "session_" + (m.group(1) if m else "?")
+                if sid not in seen_sids:
+                    seen_sids.add(sid)
+                    ui_q.put(("cot_session", sid, f))
                 try:
                     size = os.path.getsize(f)
                 except OSError:
@@ -677,9 +728,11 @@ def watch_loop(rollout_dir, job_q, ui_q, pause, state, stop=None):
                         continue
                     tag = active.get(f)
                     if tag is None:
-                        m = re.search(r"session_([0-9a-f]+)", f)
-                        tag = active[f] = (m.group(1) if m else "?")[:6]
+                        tag = active[f] = (sid, sid[8:14])
                     stamp = time.strftime("%H:%M:%S")
+                    focus = focus_state.get("sid")
+                    if focus is not None and sid != focus:
+                        continue        # 不是当前视图：只推进偏移，不翻译
                     for line in data[:cut].split(b"\n"):
                         line = line.strip()
                         if not line:
@@ -691,12 +744,8 @@ def watch_loop(rollout_dir, job_q, ui_q, pause, state, stop=None):
                         rt = ((obj.get("response") or {}).get("reasoningText") or "").strip()
                         if not rt:
                             continue
-                        label = stamp if len(active) == 1 else f"{stamp} · {tag}"
-                        enqueue_cot(job_q, state, rt, label)
-            newest = max(files, key=os.path.getmtime) if files else None
-            if newest is not None and newest != last_newest:
-                last_newest = newest
-                ui_q.put(("cot_file", os.path.basename(newest), newest))
+                        label = stamp if len(active) == 1 else f"{stamp} · {tag[1]}"
+                        enqueue_cot(job_q, state, rt, label, sid)
         except Exception as e:
             ui_q.put(("watch_error", f"{type(e).__name__}: {e}", None))
         # 目录事件到达即醒；否则最多等 5 秒兜底全扫一次
@@ -732,24 +781,28 @@ def zcode_watch(ui_q):
             time.sleep(2.0)
 
 CACHE_LOCK = threading.Lock()
+STATE_LOCK = threading.Lock()   # state 由监听线程、worker、UI 线程共用
 
 def worker_thread(job_q, ui_q, pause, state, cache):
     """翻译线程（多个并发）：火山为主、Bing 次之、MyMemory 兜底。"""
     translators = [Volc(), BingCN(), MyMem()]
 
-    def mark_done(text):
-        state[text] = "done"
-        if sum(1 for v in state.values() if v == "done") > 1200:
-            stale = [k for k, v in state.items() if v == "done"][:200]
-            for k in stale:
-                state.pop(k, None)
+    def mark_done(key):
+        with STATE_LOCK:
+            state[key] = "done"
+            done = [k for k, v in state.items() if v == "done"]
+            if len(done) > 1200:
+                for k in done[:200]:
+                    state.pop(k, None)
 
     while True:
         kind, text, meta = job_q.get()
         if kind == "exit":
             return
+        skey = (meta[1], text) if kind == "cot" else text
         if kind == "cot" and pause.is_set():
-            state.pop(text, None)   # 暂停：释放该段，之后可由「回溯」重入队
+            with STATE_LOCK:
+                state.pop(skey, None)   # 暂停：释放该段，之后可由「回溯」重入队
             continue
         with CACHE_LOCK:
             hit = cache.get(text)
@@ -766,7 +819,8 @@ def worker_thread(job_q, ui_q, pause, state, cache):
                     if len(cache) > 500:
                         cache.popitem(last=False)
             except Interrupted:
-                state.pop(text, None)   # 中断：释放，可重试
+                with STATE_LOCK:
+                    state.pop(skey, None)   # 中断：释放，可重试
                 log(f"{kind} 中断于 {meta[:2] if isinstance(meta, tuple) else meta}")
                 ui_q.put(("result", kind, meta, "", -1))
                 continue
@@ -775,7 +829,7 @@ def worker_thread(job_q, ui_q, pause, state, cache):
                 log(f"worker: {e}")
         out, fail_n, dt, cut, provider = hit
         if kind == "cot":
-            mark_done(text)
+            mark_done(skey)
         log(f"{kind} {dt:.1f}s {provider} fail={fail_n} {len(text)}字")
         ui_q.put(("result", kind, meta, out, fail_n if not cut else -2))
 
@@ -795,6 +849,16 @@ class App:
         self.last_seq = None
         self.expanded = False
         self.cot_path = None
+        self.session_files = {}     # sid -> 会话文件路径
+        self.session_titles = {}    # sid -> 标题
+        self.session_buffers = {}   # sid -> [(文本, tags)]
+        self.session_sizes = {}     # sid -> 已缓存字符数
+        self.global_log = []        # 全部会话模式用 [(sid, 文本, tags)]
+        self.view_sid = None        # 当前显示的会话；None = 全部会话
+        self.auto_sid = None        # 自动跟随目标
+        self._focus_last = None     # 上次看到的人类输入会话
+        self._all_chosen = False    # 用户是否手动选了「全部会话」
+        self.focus_state = {"sid": None}   # 后台只翻这个会话；None = 全部
         self.s = max(1.0, root.winfo_fpixels("1i") / 96)  # DPI 缩放
 
         root.withdraw()
@@ -816,7 +880,7 @@ class App:
 
         threading.Thread(target=watch_loop,
                          args=(rollout_dir, self.job_q, self.ui_q, self.pause,
-                               self.state, self.stop_ev),
+                               self.state, self.focus_state, self.stop_ev),
                          daemon=True).start()
         threading.Thread(target=zcode_watch, args=(self.ui_q,), daemon=True).start()
         for _ in range(3):
@@ -827,6 +891,7 @@ class App:
         write_lock({"pid": os.getpid()})
         root.after(120, self._drain_ui)
         root.after(300, self._poll_clip)
+        root.after(10000, self._poll_focus)
         root.protocol("WM_DELETE_WINDOW", self.quit)
 
     # ---- 构建界面
@@ -988,16 +1053,31 @@ class App:
         box = tk.Frame(self.content, bg=BG)
         box.grid(row=0, column=0, sticky="nsew", padx=6, pady=(4, 2))
         box.columnconfigure(0, weight=1)
-        box.rowconfigure(0, weight=1)
+        text_row = 0
+        if name == "cot":
+            bar = tk.Frame(box, bg=BG)
+            bar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 2))
+            self.sess_lbl = tk.Label(bar, text="", bg=BG, fg=DIM,
+                                     font=FONT_S, cursor="hand2")
+            self.sess_lbl.pack(side="left")
+            self.sess_lbl.bind("<Button-1>", self._show_session_menu)
+            self.sess_bar = bar
+            bar.grid_remove()
+            self._sess_pop = None
+            text_row = 1
+        box.rowconfigure(text_row, weight=1)
         text = tk.Text(box, wrap="word", relief="flat", bd=0, highlightthickness=0,
                        bg=BG, fg=FG, insertbackground=FG, padx=8, pady=4,
                        font=FONT, state="disabled", height=height)
-        text.grid(row=0, column=0, sticky="nsew")
+        text.grid(row=text_row, column=0, sticky="nsew")
         text.tag_configure("sep", foreground=DIM)
         text.tag_configure("fail", foreground=FAIL)
         menu = tk.Menu(self.main, tearoff=0, bg=PANEL, fg=FG, font=FONT_S,
                        activebackground=LINE, activeforeground=FG)
-        menu.add_command(label="清空", command=lambda: self._clear(text))
+        if name == "cot":
+            menu.add_command(label="清空", command=self._clear_cot)
+        else:
+            menu.add_command(label="清空", command=lambda: self._clear(text))
         text.bind("<Button-3>",
                   lambda e: self._popup(menu, e.x_root, e.y_root))
         if name == "clip":
@@ -1006,8 +1086,173 @@ class App:
             self.cot_box, self.cot_text = box, text
             sb = ttk.Scrollbar(box, style="Dark.Vertical.TScrollbar",
                                command=text.yview)
-            sb.grid(row=0, column=1, sticky="ns")
+            sb.grid(row=text_row, column=1, sticky="ns")
             text.configure(yscrollcommand=sb.set)
+
+    # ---- 会话隔离
+
+    @staticmethod
+    def _short(sid):
+        return sid[8:14] if sid else "?"
+
+    def _session_name(self, sid):
+        title = (self.session_titles.get(sid) or "").strip()
+        return title[:18] if title else self._short(sid)
+
+    def _ordered_sids(self):
+        def mtime(sid):
+            p = self.session_files.get(sid)
+            try:
+                return os.path.getmtime(p) if p else 0
+            except OSError:
+                return 0
+        sids = [s for s in self.session_files
+                if self.session_files[s] and os.path.exists(self.session_files[s])]
+        sids.sort(key=mtime, reverse=True)
+        if self.view_sid in sids:      # 当前会话置顶，一眼能看到勾
+            sids.remove(self.view_sid)
+            sids.insert(0, self.view_sid)
+        return sids
+
+    def _prune_sessions(self):
+        """ZCode 删除会话后，清掉本地残留，避免卡在已不存在的 sid 上。"""
+        gone = [sid for sid, p in self.session_files.items()
+                if not p or not os.path.exists(p)]
+        if not gone:
+            return
+        for sid in gone:
+            self.session_files.pop(sid, None)
+            self.session_titles.pop(sid, None)
+            self.session_buffers.pop(sid, None)
+            self.session_sizes.pop(sid, None)
+        self.global_log = [x for x in self.global_log if x[0] not in gone]
+        if self.view_sid in gone:
+            sids = self._ordered_sids()
+            self.view_sid = sids[0] if sids else None
+            self._all_chosen = False
+            self.focus_state["sid"] = self.view_sid
+            self._render_cot()
+        self._refresh_session_bar()
+        log(f"清理已删除会话 {len(gone)} 个")
+
+    def _refresh_session_bar(self):
+        if len(self.session_files) > 1:
+            self.sess_bar.grid()
+            name = "全部会话" if self.view_sid is None else self._session_name(self.view_sid)
+            self.sess_lbl.configure(text=f"{name} ▾")
+        else:
+            self.sess_bar.grid_remove()
+
+    def _show_session_menu(self, e=None):
+        self._close_session_popup()
+        pop = tk.Toplevel(self.main)
+        pop.withdraw()
+        pop.overrideredirect(True)
+        pop.configure(bg=LINE)
+        pop.attributes("-topmost", True)
+        inner = tk.Frame(pop, bg=PANEL)
+        inner.pack(fill="both", expand=True, padx=1, pady=1)
+
+        def pick(sid):
+            self._pick_session(sid)
+            self._sess_pop = None
+            pop.destroy()
+
+        def add(label, sid):
+            row = tk.Label(inner, text=label, bg=PANEL, fg=FG, font=FONT_S,
+                           anchor="w", padx=10, pady=4, cursor="hand2")
+            row.pack(fill="x")
+            row.bind("<Enter>", lambda _e: row.configure(bg=LINE))
+            row.bind("<Leave>", lambda _e: row.configure(bg=PANEL))
+
+            def on_click(_e):
+                pick(sid)
+                return "break"
+            row.bind("<Button-1>", on_click)
+
+        for sid in self._ordered_sids()[:12]:
+            mark = "●  " if sid == self.view_sid else "    "
+            add(mark + self._session_name(sid), sid)
+        tk.Frame(inner, bg=LINE, height=1).pack(fill="x", pady=2)
+        add(("●  " if self.view_sid is None else "    ") + "全部会话", None)
+
+        pop.update_idletasks()
+        w = max(self.sess_lbl.winfo_width(), pop.winfo_reqwidth())
+        h = pop.winfo_reqheight()
+        x = self.sess_lbl.winfo_rootx()
+        y = self.sess_lbl.winfo_rooty() + self.sess_lbl.winfo_height() + 2
+        sh = self.root.winfo_screenheight()
+        if y + h > sh - 8:
+            y = self.sess_lbl.winfo_rooty() - h - 2
+        pop.geometry(f"{w}x{h}+{x}+{y}")
+        pop.deiconify()
+        pop.lift()
+        pop.focus_force()
+        pop.grab_set()
+        pop.bind("<Escape>", lambda _e: pop.destroy())
+        pop.bind("<Button-1>", lambda _e: pop.destroy())
+        self._sess_pop = pop
+
+    def _close_session_popup(self):
+        pop = getattr(self, "_sess_pop", None)
+        if pop is not None:
+            try:
+                if pop.winfo_exists():
+                    pop.destroy()
+            except tk.TclError:
+                pass
+            self._sess_pop = None
+
+    def _pick_session(self, sid):
+        if sid is not None:
+            path = self.session_files.get(sid)
+            if not path or not os.path.exists(path):
+                return
+        self.view_sid = sid
+        self._all_chosen = sid is None
+        self.focus_state["sid"] = sid
+        self._render_cot()
+        self._refresh_session_bar()
+        if sid is not None:
+            self.backlog(sid=sid)   # 切过去补该会话最近历史（分段去重）
+
+    def _clear_cot(self):
+        if self.view_sid is None:
+            self.global_log = []
+            for sid in list(self.session_buffers):
+                self.session_buffers[sid] = []
+                self.session_sizes[sid] = 0
+        else:
+            self.session_buffers[self.view_sid] = []
+            self.session_sizes[self.view_sid] = 0
+            self.global_log = [x for x in self.global_log
+                               if x[0] != self.view_sid]
+        self._clear(self.cot_text)
+
+    def _render_cot(self):
+        self._clear(self.cot_text)
+        if self.view_sid is None:
+            for sid, text, tags in self.global_log:
+                self._append(self.cot_text, text, tags)
+        else:
+            for text, tags in self.session_buffers.get(self.view_sid, []):
+                self._append(self.cot_text, text, tags)
+
+    def _append_cot(self, sid, text, tags=()):
+        buf = self.session_buffers.setdefault(sid, [])
+        buf.append((text, tags))
+        size = self.session_sizes.get(sid, 0) + len(text)
+        while size > 80_000 and buf:
+            old, _ = buf.pop(0)
+            size -= len(old)
+        self.session_sizes[sid] = size
+        self.global_log.append((sid, text, tags))
+        gsize = sum(len(t) for _, t, _ in self.global_log)
+        while gsize > 120_000 and self.global_log:
+            _, old, _ = self.global_log.pop(0)
+            gsize -= len(old)
+        if self.view_sid is None or self.view_sid == sid:
+            self._append(self.cot_text, text, tags)
 
     def _switch_tab(self, name):
         """切换标签页：激活项亮色+下划线，其余面板 grid_remove 收起。"""
@@ -1056,11 +1301,21 @@ class App:
             self.pause.clear()
             self.pause_btn.configure(text="暂停")
         self._switch_tab("cot")             # 点球默认开思考流翻译
+        sid = latest_input_session()
+        if sid and sid in self.session_files:
+            self.auto_sid = sid
+            self.view_sid = sid
+            self._all_chosen = False
+            self.focus_state["sid"] = sid
+            self._focus_last = sid
+            self._render_cot()
+            self._refresh_session_bar()
         self.root.after(250, self.backlog)  # 并补缺口
         log("expand")
 
     def collapse(self):
         self.expanded = False
+        self._close_session_popup()
         self._save_cfg()
         self.main.withdraw()
         self.ball.deiconify()
@@ -1073,16 +1328,19 @@ class App:
         if self.pause.is_set():
             self.pause.clear()
             self.pause_btn.configure(text="暂停")
+            self.backlog()      # 继续时补上暂停期间漏掉的段落
         else:
             self.pause.set()
             self.pause_btn.configure(text="继续")
 
-    def backlog(self, cap=8000):
-        """点击「思考流翻译」：回溯翻译当前会话最近的思考（分段去重、可重试）。"""
-        if self.pause.is_set():
-            self.pause.clear()
-            self.pause_btn.configure(text="暂停")
-        path = self.cot_path
+    def backlog(self, cap=8000, sid=None):
+        """点击「思考流翻译」：回溯翻译当前会话最近的思考（分段去重、可重试）。
+        全部会话视图不回溯单个会话，避免把某一个会话的旧历史混进来。"""
+        if sid is None:
+            sid = self.view_sid
+            if sid is None:
+                return
+        path = self.session_files.get(sid)
         if not path or not os.path.exists(path):
             return
         try:
@@ -1110,7 +1368,8 @@ class App:
                 break
         n = 0
         for rt in reversed(picks):
-            n += enqueue_cot(self.job_q, self.state, rt, time.strftime("%H:%M:%S"))[0]
+            n += enqueue_cot(self.job_q, self.state, rt,
+                             time.strftime("%H:%M:%S"), sid)[0]
         log(f"backlog 入队 {n} 段")
 
     def quit_user(self):
@@ -1120,6 +1379,7 @@ class App:
         self.quit()
 
     def quit(self):
+        self._close_session_popup()
         self._save_cfg()
         self.stop_ev.set()
         try:
@@ -1193,8 +1453,29 @@ class App:
                 log("ZCode 已退出，小窗跟随退出")
                 self.quit()
                 return
-            elif name == "cot_file":
-                self.cot_path = ev[2]
+            elif name == "cot_session":
+                sid, path = ev[1], ev[2]
+                self.session_files[sid] = path
+                if sid not in self.session_titles:
+                    self.session_titles.update(session_titles([sid]))
+                if self.auto_sid is None:
+                    self.auto_sid = sid
+                if self.view_sid is None and not self._all_chosen:
+                    self.view_sid = sid      # 首个会话默认成为当前视图
+                    self.focus_state["sid"] = sid
+                    self._render_cot()
+                elif not self._all_chosen and sid != self.view_sid \
+                        and latest_input_session() == sid:
+                    # 新会话文件出现，且正是刚发过消息的会话：立即跟过去
+                    self._focus_last = sid
+                    self.auto_sid = sid
+                    self.view_sid = sid
+                    self._all_chosen = False
+                    self.focus_state["sid"] = sid
+                    self._render_cot()
+                    self.backlog(sid=sid)
+                    log(f"focus -> {self._session_name(sid)}")
+                self._refresh_session_bar()
             elif name == "watch_error":
                 log("watch: " + ev[1])
             elif name == "result":
@@ -1209,24 +1490,46 @@ class App:
             self._clear(self.clip_text)
             self._append(self.clip_text, out, ("fail",) if fail_n else ())
             return
-        rid, label, seq, total, skip = meta
+        rid, sid, label, seq, total, skip = meta
         self.rbuf.setdefault(rid, {})[seq] = (out, fail_n)
         nxt = self.rnext.get(rid, 0)
         while nxt < total and (nxt in skip or nxt in self.rbuf[rid]):
             if nxt not in skip:
                 o, f = self.rbuf[rid].pop(nxt)
                 if f == -1:       # 中断
-                    self._append(self.cot_text, "── 已中断 ──\n", ("sep",))
+                    self._append_cot(sid, "── 已中断 ──\n", ("sep",))
                 else:
                     if nxt == 0:
-                        self._append(self.cot_text, f"── {label} ──\n", ("sep",))
-                    self._append(self.cot_text, o + "\n",
-                                 ("fail",) if f else ())
+                        self._append_cot(sid, f"── {label} ──\n", ("sep",))
+                    self._append_cot(sid, o + "\n",
+                                     ("fail",) if f else ())
             nxt += 1
         self.rnext[rid] = nxt
         if nxt >= total:
             self.rbuf.pop(rid, None)
             self.rnext.pop(rid, None)
+
+    def _poll_focus(self):
+        """跟随人类输入：用户在哪个会话打字，窗口切到哪个会话。
+        10 秒一轮；sid 无论是否已有 rollout 文件都记为已见，避免反复切。"""
+        try:
+            self._prune_sessions()
+            if self.expanded:
+                sid = latest_input_session()
+                if sid and sid != self._focus_last:
+                    self._focus_last = sid
+                    if sid in self.session_files and self.view_sid != sid:
+                        self.auto_sid = sid
+                        self.view_sid = sid
+                        self._all_chosen = False
+                        self.focus_state["sid"] = sid
+                        self._render_cot()
+                        self._refresh_session_bar()
+                        self.backlog(sid=sid)
+                        log(f"focus -> {self._session_name(sid)}")
+        except Exception as e:
+            log(f"focus: {e}")
+        self.root.after(10000, self._poll_focus)
 
     def _poll_clip(self):
         if self.expanded:

@@ -11,6 +11,7 @@ A floating ball that translates English reasoning traces into Chinese in real ti
 - **Reasoning stream**: watches ZCode's rollout directory with `ReadDirectoryChangesW`; each finished reasoning round is split into segments, translated by three concurrent workers, and shown as it completes. Latency from file write to on-screen text measured at 0.05 to 0.5 seconds.
 - **Clipboard translation**: copy any English text while the window is open and get Chinese within a second.
 - **Tabbed window**: one window, two tabs, a pause button. Reading position never jumps; the view only follows when you are already at the bottom.
+- **Session isolation**: several conversations can run at once, each keeps its own buffer, and the window shows only the current one. Click the session name to switch. Other sessions are not translated in the background; switching back backfills recent history.
 - **Round ball**: a small dark circle docked at the right edge of the screen, with no rectangular frame. Click to expand, click × to collapse. Collapsing pauses all translation.
 
 ![clipboard](https://raw.githubusercontent.com/cobaltna/cot-peek/main/screenshots/clipboard.png)

@@ -21,6 +21,10 @@
 
 ![划词翻译](screenshots/clipboard.png)
 
+## 多开不串台
+
+同时开几个会话，每个会话的思考分开存放。窗口只显示当前会话，点会话名就能切换。其他会话不重复翻译，切过去再补历史。
+
 ## 不添乱
 
 - 纯外部读取。只看 ZCode 的会话文件和进程快照，不写入，不注入，不碰模型上下文。
@@ -47,7 +51,7 @@ pwsh cot-peek\plugin\install.ps1
 
 ## 它是怎么工作的
 
-模型每完成一轮思考，ZCode 会把这段思维链连同本次 API 往返追加写进 `~/.zcode/cli/rollout/` 下的会话文件。思考小窗用 ReadDirectoryChangesW 盯住这个目录，文件一有动静立刻读增量、按句切段、并发翻译、逐段上屏。退出检测对 ZCode 根进程句柄做 WaitForSingleObject，进程一结束立刻跟随退出，全程零轮询。
+模型每完成一轮思考，ZCode 会把这段思维链连同本次 API 往返追加写进 `~/.zcode/cli/rollout/` 下的会话文件。思考小窗用 ReadDirectoryChangesW 盯住这个目录，文件一有动静立刻读增量、按句切段、并发翻译、逐段上屏。每个会话文件对应一个会话，窗口按会话分开显示。退出检测对 ZCode 根进程句柄做 WaitForSingleObject，进程一结束立刻跟随退出，全程零轮询。
 
 ## 协议
 
