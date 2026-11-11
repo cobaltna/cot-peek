@@ -682,6 +682,27 @@ def _dir_watch_thread(path, ev, stop):
             stop.wait(0.5)
 
 
+def sid_short(sid):
+    """会话短标记：session_<hex> 与 sess_<uuid> 两种 id 都能取到可读片段。"""
+    if sid.startswith("sess_"):
+        return sid[5:13]
+    return sid[8:14] if len(sid) > 14 else sid
+
+
+def rollout_sid(path):
+    """从文件名取会话 id。ZCode 现在有两种命名：
+    model-io-session_<hex>.jsonl 和 model-io-sess_<uuid>.jsonl。"""
+    m = re.match(r"^model-io-(.+)\.jsonl$", os.path.basename(path))
+    if not m:
+        return None
+    sid = m.group(1)
+    if sid.startswith("sess_subagent_"):
+        return None          # 子代理会话不是用户会话
+    if not sid.startswith(("session_", "sess_")):
+        return None
+    return sid
+
+
 def watch_loop(rollout_dir, job_q, ui_q, pause, state, focus_state, stop=None):
     """按文件独立跟踪各会话：启动时已有的文件跳过历史；启动后新出现的
     会话文件从头翻（≤2MB，整行可能已在轮询间隙写完；更大的续开旧会话
@@ -694,19 +715,20 @@ def watch_loop(rollout_dir, job_q, ui_q, pause, state, focus_state, stop=None):
     offsets = {}
     started = False
     active = {}          # path -> (sid, 会话短标记)
-    seen_sids = set()
+    seen_paths = {}      # sid -> 已登记的文件路径，路径变了要重新登记
     while not stop.is_set():
         try:
-            files = glob.glob(os.path.join(rollout_dir, "model-io-session_*.jsonl"))
+            files = glob.glob(os.path.join(rollout_dir, "model-io-*.jsonl"))
             if not started:
                 started = True
                 for f in files:
                     offsets[f] = os.path.getsize(f)
             for f in files:
-                m = re.search(r"session_([0-9a-f]+)", f)
-                sid = "session_" + (m.group(1) if m else "?")
-                if sid not in seen_sids:
-                    seen_sids.add(sid)
+                sid = rollout_sid(f)
+                if not sid:
+                    continue
+                if seen_paths.get(sid) != f:
+                    seen_paths[sid] = f
                     ui_q.put(("cot_session", sid, f))
                 try:
                     size = os.path.getsize(f)
@@ -728,7 +750,7 @@ def watch_loop(rollout_dir, job_q, ui_q, pause, state, focus_state, stop=None):
                         continue
                     tag = active.get(f)
                     if tag is None:
-                        tag = active[f] = (sid, sid[8:14])
+                        tag = active[f] = (sid, sid_short(sid))
                     stamp = time.strftime("%H:%M:%S")
                     focus = focus_state.get("sid")
                     if focus is not None and sid != focus:
@@ -1093,7 +1115,7 @@ class App:
 
     @staticmethod
     def _short(sid):
-        return sid[8:14] if sid else "?"
+        return sid_short(sid) if sid else "?"
 
     def _session_name(self, sid):
         title = (self.session_titles.get(sid) or "").strip()
@@ -1115,28 +1137,24 @@ class App:
         return sids
 
     def _prune_sessions(self):
-        """ZCode 删除会话后，清掉本地残留，避免卡在已不存在的 sid 上。"""
-        gone = [sid for sid, p in self.session_files.items()
-                if not p or not os.path.exists(p)]
-        if not gone:
+        """当前会话文件被删除时，退回仍存在的会话；只清显示，不删登记，
+        文件以后恢复还能继续用。"""
+        if self.view_sid is None:
             return
-        for sid in gone:
-            self.session_files.pop(sid, None)
-            self.session_titles.pop(sid, None)
-            self.session_buffers.pop(sid, None)
-            self.session_sizes.pop(sid, None)
-        self.global_log = [x for x in self.global_log if x[0] not in gone]
-        if self.view_sid in gone:
-            sids = self._ordered_sids()
-            self.view_sid = sids[0] if sids else None
-            self._all_chosen = False
-            self.focus_state["sid"] = self.view_sid
-            self._render_cot()
+        path = self.session_files.get(self.view_sid)
+        if path and os.path.exists(path):
+            return
+        sids = self._ordered_sids()
+        old = self.view_sid
+        self.view_sid = sids[0] if sids else None
+        self._all_chosen = False
+        self.focus_state["sid"] = self.view_sid
+        self._render_cot()
         self._refresh_session_bar()
-        log(f"清理已删除会话 {len(gone)} 个")
+        log(f"会话文件已删除，视图从 {self._short(old)} 退回 {self._short(self.view_sid)}")
 
     def _refresh_session_bar(self):
-        if len(self.session_files) > 1:
+        if len(self._ordered_sids()) > 1:
             self.sess_bar.grid()
             name = "全部会话" if self.view_sid is None else self._session_name(self.view_sid)
             self.sess_lbl.configure(text=f"{name} ▾")
@@ -1302,7 +1320,8 @@ class App:
             self.pause_btn.configure(text="暂停")
         self._switch_tab("cot")             # 点球默认开思考流翻译
         sid = latest_input_session()
-        if sid and sid in self.session_files:
+        if sid and sid in self.session_files \
+                and os.path.exists(self.session_files[sid]):
             self.auto_sid = sid
             self.view_sid = sid
             self._all_chosen = False
@@ -1455,6 +1474,7 @@ class App:
                 return
             elif name == "cot_session":
                 sid, path = ev[1], ev[2]
+                new = self.session_files.get(sid) != path
                 self.session_files[sid] = path
                 if sid not in self.session_titles:
                     self.session_titles.update(session_titles([sid]))
@@ -1476,6 +1496,8 @@ class App:
                     self.backlog(sid=sid)
                     log(f"focus -> {self._session_name(sid)}")
                 self._refresh_session_bar()
+                if new:
+                    log(f"发现会话 {sid_short(sid)}，共 {len(self._ordered_sids())} 个")
             elif name == "watch_error":
                 log("watch: " + ev[1])
             elif name == "result":
@@ -1518,7 +1540,8 @@ class App:
                 sid = latest_input_session()
                 if sid and sid != self._focus_last:
                     self._focus_last = sid
-                    if sid in self.session_files and self.view_sid != sid:
+                    path = self.session_files.get(sid)
+                    if path and os.path.exists(path) and self.view_sid != sid:
                         self.auto_sid = sid
                         self.view_sid = sid
                         self._all_chosen = False
