@@ -398,7 +398,7 @@ FENCE_RE = re.compile(r"```[\s\S]*?```")
 INLINE_RE = re.compile(r"`[^`\n]+`")
 URL_RE = re.compile(r"https?://[^\s)\]}>\"']+")
 PATH_RE = re.compile(r"[\w./\\:+-]+\.(?:py|js|ts|json|md|txt|html?|css|ya?ml|toml|ps1|sh|bat|exe|dll|png|jpg|svg|db|sqlite|log|csv|ini)\b", re.I)
-TOKEN_OPEN, TOKEN_CLOSE = "[[", "]]"   # 火山/Bing/MyMemory 都能原样保留
+TOKEN_OPEN, TOKEN_CLOSE = "[[", "]]"   # 腾讯/MyMemory 都能原样保留
 RESTORE_RE = re.compile(r"(?:\[\[|\u27E6|\u3010)\s*(\d+)\s*(?:\]\]|\u27E7|\u3011)")
 
 def protect(text):
@@ -744,7 +744,7 @@ CACHE_LOCK = threading.Lock()
 STATE_LOCK = threading.Lock()   # state 由监听线程、worker、UI 线程共用
 
 def worker_thread(job_q, ui_q, pause, state, cache):
-    """翻译线程（多个并发）：火山为主、Bing 次之、MyMemory 兜底。"""
+    """翻译线程（多个并发）：腾讯为主、MyMemory 兜底。"""
     translators = [Tencent(), MyMem()]
 
     def mark_done(key):
