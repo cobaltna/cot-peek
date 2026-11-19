@@ -28,14 +28,14 @@ Requirements: Windows 10/11, any Python 3 with tkinter.
 
 Read this before installing:
 
-- **Network access**: translation requests go to three free public web endpoints, in fallback order: Volcengine translate web API (`translate.volcengine.com`), Bing translator (`cn.bing.com`), MyMemory (`api.mymemory.translated.net`). No keys, no accounts, no telemetry. If all three fail, the original English text is kept and marked red.
-- **Files read**: `~/.zcode/cli/rollout/model-io-session_*.jsonl` and the system process list. Nothing else.
+- **Network access**: translation requests go to two free public web endpoints, in fallback order: Tencent TranSmart (`transmart.qq.com`), MyMemory (`api.mymemory.translated.net`). No keys, no accounts, no telemetry. If both fail, the original English text is kept and marked red.
+- **Files read**: `~/.zcode/cli/rollout/model-io-*.jsonl` and the system process list. Nothing else.
 - **Files written**: only inside the plugin's own directory: `cot_peek.log`, `cot_peek.json`, `cot_peek.lock`.
 - **Processes**: runs `pythonw.exe cot_peek.py`; `install.ps1` registers a Windows scheduled task via `schtasks.exe`.
 - **No hooks, no MCP servers, no model-context injection, no writes to ZCode data**.
 
 ## Third-party services
 
-Translation is performed by Volcengine, Microsoft Bing, and MyMemory public web endpoints. Their availability and terms may change at any time; Cot Peek degrades gracefully when they do. All other code is original, MIT licensed, Python standard library plus tkinter only.
+Translation is performed by Tencent TranSmart and MyMemory public web endpoints. Their availability and terms may change at any time; Cot Peek degrades gracefully when they do. All other code is original, MIT licensed, Python standard library plus tkinter only.
 
 ![ball](https://raw.githubusercontent.com/cobaltna/cot-peek/main/screenshots/ball.png)

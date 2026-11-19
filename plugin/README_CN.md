@@ -28,14 +28,14 @@
 
 安装前请读这一段：
 
-- **网络访问**：翻译请求发往三个免费公共网页接口，按序降级：火山翻译网页版 `translate.volcengine.com`、微软必应翻译 `cn.bing.com`、MyMemory `api.mymemory.translated.net`。不需要 key，不需要账号，无任何遥测。三个全挂时保留英文原文并标红。
-- **读取的文件**：`~/.zcode/cli/rollout/model-io-session_*.jsonl` 与系统进程列表，仅此两项。
+- **网络访问**：翻译请求发往两个免费公共网页接口，按序降级：腾讯 TranSmart `transmart.qq.com`、MyMemory `api.mymemory.translated.net`。不需要 key，不需要账号，无任何遥测。两个全挂时保留英文原文并标红。
+- **读取的文件**：`~/.zcode/cli/rollout/model-io-*.jsonl` 与系统进程列表，仅此两项。
 - **写入的文件**：只在插件自己的目录里写 `cot_peek.log`、`cot_peek.json`、`cot_peek.lock`。
 - **进程**：运行 `pythonw.exe cot_peek.py`；`install.ps1` 通过 `schtasks.exe` 注册 Windows 计划任务。
 - **没有 hook，没有 MCP server，不注入模型上下文，不写 ZCode 的任何数据**。
 
 ## 第三方服务
 
-翻译由火山翻译、微软必应、MyMemory 的公共网页接口完成，可用性与条款随对方变化，接口变动时工具自动降级。其余代码全部原创，MIT 协议，只用 Python 标准库加 tkinter。
+翻译由腾讯 TranSmart、MyMemory 的公共网页接口完成，可用性与条款随对方变化，接口变动时工具自动降级。其余代码全部原创，MIT 协议，只用 Python 标准库加 tkinter。
 
 ![悬浮球](https://raw.githubusercontent.com/cobaltna/cot-peek/main/screenshots/ball.png)

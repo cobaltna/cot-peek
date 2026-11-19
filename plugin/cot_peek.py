@@ -3,13 +3,13 @@
 
 形态：屏幕右侧一枚圆形小球（无矩形底框），点击展开翻译窗，再点收起。
 通道：
-  1. 思考流翻译：监听 ~/.zcode/cli/rollout/model-io-session_*.jsonl
+  1. 思考流翻译：监听 ~/.zcode/cli/rollout/model-io-*.jsonl
      （ReadDirectoryChangesW 目录事件 + 5s 兜底扫描），每次 API 往返完成
      追加的 response.reasoningText 逐轮翻成中文。
      点标题「思考流翻译」回溯翻译之前的思考；「暂停/继续」随时中断。
   2. 划词翻译：展开状态下复制英文，约 1 秒出中文。
-翻译：火山 web 接口（主）→ cn.bing.com → MyMemory，
-按行分块（≤900 字），代码围栏/URL/术语占位保护。
+翻译：腾讯 TranSmart 免密接口（主）→ MyMemory（兜底），
+按接口上限分块，代码围栏/URL/术语占位保护。
 生命周期：×只关窗口收起回小球（收起=暂停）；小球右键「退出小窗」后，
 本次 ZCode 会话内不再被计划任务拉起；ZCode 根进程退出即感知、小窗跟随退出
 （OpenProcess+WaitForSingleObject，零轮询开销）；
@@ -21,8 +21,6 @@ import base64
 import ctypes
 import ctypes.wintypes as wt
 import glob
-import http.client
-import http.cookiejar
 import itertools
 import json
 import math
@@ -429,110 +427,50 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 class Interrupted(Exception):
     """暂停被触发，当前文本翻译中止。"""
 
-class BingCN:
-    """cn.bing.com 免费网页翻译。token 缓存 45 分钟；POST 走 keep-alive
-    长连接（每线程一个实例）；单次请求上限约 900 字，超长自行切块。"""
+class Tencent:
+    """腾讯 TranSmart 免密接口：约 0.2~1s/次，单请求约 5000 字上限，
+    保留换行、代码、URL 与占位符。ret_code 非 succ 视为失败，重试一次。"""
 
-    def __init__(self):
-        self.opener = urllib.request.build_opener(
-            urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
-        self.token = None
-        self.token_time = 0.0
-        self.conn = None
-
-    def _refresh(self):
-        req = urllib.request.Request(
-            "https://cn.bing.com/translator",
-            headers={"User-Agent": UA, "Accept": "text/html,application/xhtml+xml",
-                     "Accept-Language": "zh-CN,zh;q=0.9"})
-        html = self.opener.open(req, timeout=10).read().decode("utf-8", "replace")
-        ig = re.search(r'IG:"([^"]+)"', html)
-        params = re.search(r'params_AbusePreventionHelper\s*=\s*\[([^\]]+)\]', html)
-        iid = re.search(r'data-iid="([^"]+)"', html)
-        if not (ig and params):
-            raise RuntimeError("bing 页面结构变化")
-        p = json.loads("[" + params.group(1) + "]")
-        self.token = (str(p[0]), p[1], ig.group(1),
-                      iid.group(1) if iid else "translator.5023")
-        self.token_time = time.time()
-
-    def _drop_conn(self):
-        if self.conn is not None:
-            try:
-                self.conn.close()
-            except OSError:
-                pass
-            self.conn = None
-
-    def _post(self, path, body):
-        if self.conn is None:
-            self.conn = http.client.HTTPSConnection("cn.bing.com", timeout=15)
-        try:
-            self.conn.request("POST", path, body=body,
-                              headers={"User-Agent": UA, "Accept": "*/*",
-                                       "Referer": "https://cn.bing.com/translator",
-                                       "Origin": "https://cn.bing.com",
-                                       "Content-Type": "application/x-www-form-urlencoded",
-                                       "Accept-Language": "zh-CN,zh;q=0.9"})
-            resp = self.conn.getresponse()
-            raw = resp.read().decode("utf-8", "replace")
-            if resp.status != 200:
-                raise RuntimeError(f"http {resp.status}")
-            return raw
-        except Exception:
-            self._drop_conn()
-            raise
+    URL = "https://transmart.qq.com/api/imt"
+    CAP = 4000
+    CLIENT_KEY = "browser-chrome-126.0.0-Windows-10"
 
     def translate(self, text):
-        if not self.token or time.time() - self.token_time > 2700:
-            self._refresh()
-        last = ""
-        for _ in range(2):
-            key, token, ig, iid = self.token
-            body = urllib.parse.urlencode(
-                {"fromLang": "en", "text": text[:900], "to": "zh-Hans",
-                 "token": token, "key": key})
-            try:
-                raw = self._post(f"/ttranslatev3?IG={ig}&IID={iid}", body)
-                out = json.loads(raw)
-                if isinstance(out, list) and out and "translations" in out[0]:
-                    t = out[0]["translations"][0]["text"]
-                    if t.strip():
-                        return t
-                last = json.dumps(out, ensure_ascii=False)[:100]
-            except (ValueError, IndexError, OSError, RuntimeError) as e:
-                last = f"{type(e).__name__}: {str(e)[:60]}"
-            self._refresh()
-        raise RuntimeError("bing: " + last)
-
-class Volc:
-    """火山翻译免密 web 接口：约 0.2~0.8s/次，单请求约 4000 字上限，
-    无需 key/cookie。500 为瞬态错误，重试一次。"""
-
-    URL = "https://translate.volcengine.com/crx/translate/v1/"
-
-    def translate(self, text):
-        data = json.dumps({"source_language": "en", "text": text[:4000],
-                           "target_language": "zh"}).encode()
+        data = json.dumps({
+            "header": {"fn": "auto_translation", "client_key": self.CLIENT_KEY},
+            "type": "plain",
+            "model_category": "normal",
+            "source": {"lang": "en", "text_list": [text[:5000]]},
+            "target": {"lang": "zh"},
+        }).encode()
         last = ""
         for attempt in (1, 2):
             try:
                 req = urllib.request.Request(
                     self.URL, data=data,
-                    headers={"User-Agent": UA, "Content-Type": "application/json"})
-                raw = urllib.request.urlopen(req, timeout=10).read().decode("utf-8", "replace")
+                    headers={"User-Agent": UA,
+                             "Content-Type": "application/json",
+                             "Referer": "https://transmart.qq.com/zh-CN/index",
+                             "Origin": "https://transmart.qq.com"})
+                raw = urllib.request.urlopen(req, timeout=15).read().decode("utf-8", "replace")
                 out = json.loads(raw)
-                t = out.get("translation") or ""
-                if t.strip():
-                    return t
-                last = "空译文 " + json.dumps(out, ensure_ascii=False)[:80]
+                if out.get("header", {}).get("ret_code") == "succ":
+                    arr = out.get("auto_translation") or []
+                    t = arr[0] if arr else ""
+                    if t.strip():
+                        return t
+                    last = "空译文 " + raw[:80]
+                else:
+                    last = raw[:120]
             except Exception as e:
-                last = f"{type(e).__name__}: {str(e)[:60]}"
+                last = f"{type(e).__name__}: {str(e)[:80]}"
             if attempt == 1:
-                time.sleep(0.4)
-        raise RuntimeError("volc: " + last)
+                time.sleep(0.25)
+        raise RuntimeError("tencent: " + last)
 
 class MyMem:
+    CAP = 480
+
     def __init__(self):
         self.opener = urllib.request.build_opener()
 
@@ -581,7 +519,7 @@ def make_blocks(text, cap=900):
     return blocks
 
 def translate_any(text, translators, pause=None):
-    """分块保护翻译：按 translators 顺序尝试（火山→Bing→MyMemory）；
+    """分块保护翻译：按 translators 顺序尝试（腾讯→MyMemory）；
     pause 置位时在块边界中止。返回 (译文, 失败块数, provider)。"""
     parts, failed, used = [], 0, []
     for content, verbatim in make_blocks(text):
@@ -594,7 +532,7 @@ def translate_any(text, translators, pause=None):
         done = False
         for translator in translators:
             try:
-                cap = 480 if isinstance(translator, MyMem) else 900
+                cap = getattr(translator, "CAP", 900)
                 out = "".join(translator.translate(c)
                               for c in chunk_text(shielded, cap=cap))
                 parts.append(restore(out, tokens))
@@ -807,7 +745,7 @@ STATE_LOCK = threading.Lock()   # state 由监听线程、worker、UI 线程共�
 
 def worker_thread(job_q, ui_q, pause, state, cache):
     """翻译线程（多个并发）：火山为主、Bing 次之、MyMemory 兜底。"""
-    translators = [Volc(), BingCN(), MyMem()]
+    translators = [Tencent(), MyMem()]
 
     def mark_done(key):
         with STATE_LOCK:
