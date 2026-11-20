@@ -806,6 +806,7 @@ class App:
         self.cache = OrderedDict()       # 段译文缓存（多线程共享）
         self.rbuf = {}                   # 轮次重排缓冲 rid -> {seq: (out, fail_n)}
         self.rnext = {}                  # rid -> 下一待显示 seq
+        self._backlog_busy = set()       # 正在后台扫描的 sid，防重复堆栈
         self.last_seq = None
         self.expanded = False
         self.cot_path = None
@@ -1186,13 +1187,26 @@ class App:
         self._clear(self.cot_text)
 
     def _render_cot(self):
-        self._clear(self.cot_text)
+        """整段重绘。一次性批量插入，不做逐段的全文读取，切换会话不卡界面。"""
+        w = self.cot_text
         if self.view_sid is None:
-            for sid, text, tags in self.global_log:
-                self._append(self.cot_text, text, tags)
+            items = [(t, tags) for _, t, tags in self.global_log]
         else:
-            for text, tags in self.session_buffers.get(self.view_sid, []):
-                self._append(self.cot_text, text, tags)
+            items = self.session_buffers.get(self.view_sid, [])
+        # 只渲染最近 8 万字，和缓冲上限一致
+        total, cut = 0, 0
+        for i in range(len(items) - 1, -1, -1):
+            total += len(items[i][0])
+            if total >= 80_000:
+                cut = i
+                break
+        w.configure(state="normal")
+        w.delete("1.0", "end")
+        for text, tags in items[cut:]:
+            w.insert("end", text, tags)
+        w._tlen = len(w.get("1.0", "end")) - 1
+        w.configure(state="disabled")
+        w.yview_moveto(1.0)
 
     def _append_cot(self, sid, text, tags=()):
         buf = self.session_buffers.setdefault(sid, [])
@@ -1291,8 +1305,8 @@ class App:
             self.pause_btn.configure(text="继续")
 
     def backlog(self, cap=8000, sid=None):
-        """点击「思考流翻译」：回溯翻译当前会话最近的思考（分段去重、可重试）。
-        全部会话视图不回溯单个会话，避免把某一个会话的旧历史混进来。"""
+        """回溯翻译某个会话最近的思考（分段去重、可重试）。
+        大文件扫描放在后台线程，界面不卡；同一会话同时只跑一次扫描。"""
         if sid is None:
             sid = self.view_sid
             if sid is None:
@@ -1300,34 +1314,42 @@ class App:
         path = self.session_files.get(sid)
         if not path or not os.path.exists(path):
             return
-        try:
-            rounds = []
-            with open(path, "rb") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except ValueError:
-                        continue
-                    rt = ((obj.get("response") or {}).get("reasoningText") or "").strip()
-                    if rt:
-                        rounds.append(rt)
-        except OSError as e:
-            log(f"backlog 读取失败: {e}")
+        if sid in self._backlog_busy:
             return
-        picks, total = [], 0
-        for rt in reversed(rounds):
-            picks.append(rt)
-            total += len(rt)
-            if total >= cap:
-                break
-        n = 0
-        for rt in reversed(picks):
-            n += enqueue_cot(self.job_q, self.state, rt,
-                             time.strftime("%H:%M:%S"), sid)[0]
-        log(f"backlog 入队 {n} 段")
+        self._backlog_busy.add(sid)
+
+        def work():
+            try:
+                rounds = []
+                with open(path, "rb") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line or b"reasoningText" not in line:
+                            continue     # 先粗筛再解析，跳过无关大行
+                        try:
+                            obj = json.loads(line)
+                        except ValueError:
+                            continue
+                        rt = ((obj.get("response") or {}).get("reasoningText") or "").strip()
+                        if rt:
+                            rounds.append(rt)
+                picks, total = [], 0
+                for rt in reversed(rounds):
+                    picks.append(rt)
+                    total += len(rt)
+                    if total >= cap:
+                        break
+                n = 0
+                for rt in reversed(picks):
+                    n += enqueue_cot(self.job_q, self.state, rt,
+                                     time.strftime("%H:%M:%S"), sid)[0]
+                log(f"backlog 入队 {n} 段")
+            except OSError as e:
+                log(f"backlog 读取失败: {e}")
+            finally:
+                self._backlog_busy.discard(sid)
+
+        threading.Thread(target=work, daemon=True).start()
 
     def quit_user(self):
         """小球右键「退出小窗」：记录会话签名，本次 ZCode 会话内不再自动拉起。"""
@@ -1385,16 +1407,21 @@ class App:
         at_bottom = widget.yview()[1] > 0.995   # 仅当用户本来就在底部时才跟随
         widget.configure(state="normal")
         widget.insert("end", text, tags)
-        excess = len(widget.get("1.0", "end")) - 80_000
-        if excess > 0:
-            widget.delete("1.0", f"1.0+{excess}c")
+        if not hasattr(widget, "_tlen"):        # 字数计数器，避免每次全文读取
+            widget._tlen = len(widget.get("1.0", "end")) - 1
+        widget._tlen += len(text)
+        if widget._tlen > 80_000:
+            widget.delete("1.0", f"1.0+{widget._tlen - 80_000}c")
+            widget._tlen = 80_000
         widget.configure(state="disabled")
         if at_bottom and not widget.tag_ranges("sel"):
-            widget.see("end")
+            # 不用 see("end")：长中文行会触发 Uniscribe 整行重排，大文本时卡死界面
+            widget.yview_moveto(1.0)
 
     def _clear(self, widget):
         widget.configure(state="normal")
         widget.delete("1.0", "end")
+        widget._tlen = 0
         widget.configure(state="disabled")
 
     # ---- 主线程轮询
